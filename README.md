@@ -16,6 +16,7 @@ The installer provisions a lightweight [k3s](https://k3s.io/) cluster, deploys a
 ## Quick Start
 
 ```bash
+curl -sSL https://github.com/detectify/internal-scanning-installer/releases/latest/download/detectify-scanner -o detectify-scanner
 chmod +x detectify-scanner
 sudo ./detectify-scanner install
 ```
