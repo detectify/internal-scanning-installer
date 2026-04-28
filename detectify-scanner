@@ -1,0 +1,1481 @@
+#!/usr/bin/env bash
+# detectify-scanner -- Standalone installer for Detectify Internal Scanning
+# Usage: curl -sSL https://example.com/install.sh | bash
+set -o pipefail
+SCRIPT_VERSION="2.0.0"
+
+# --- Constants from values.yaml (source of truth) ---
+REGISTRY_HOST="${SCANNER_REGISTRY_HOST:-registry.detectify.com}"
+LICENSE_HOST="${SCANNER_LICENSE_HOST:-license.detectify.com}"
+CONNECTOR_HOST="${SCANNER_CONNECTOR_HOST:-connector.detectify.com}"
+REQUIRED_ENDPOINTS=("$REGISTRY_HOST" "$LICENSE_HOST" "$CONNECTOR_HOST")
+K3S_DEFAULT_CLUSTER_CIDR="10.42.0.0/16"
+K3S_DEFAULT_SERVICE_CIDR="10.43.0.0/16"
+HARD_MIN_RAM_MB=4096
+SOFT_REC_RAM_MB=8192
+HARD_MIN_DISK_GB=20
+SOFT_REC_DISK_GB=50
+K3S_VERSION="v1.31.6+k3s1"
+READINESS_TIMEOUT=300
+POLL_INTERVAL=10
+CONFIG_DIR="/etc/detectify-scanner"
+CONFIG_FILE="${CONFIG_DIR}/scanner.env"
+MAX_REGISTRY_ATTEMPTS=3
+K3S_REGISTRIES_YAML="/etc/rancher/k3s/registries.yaml"
+K3S_MANIFESTS_DIR="/var/lib/rancher/k3s/server/manifests"
+EXPECTED_PODS=("scan-scheduler" "scan-manager" "chrome-controller" "redis")
+API_SERVER_TIMEOUT=120
+NODEPORT=30000
+
+# --- Result Collection Globals ---
+RESULTS=()
+FAIL_COUNT=0
+WARN_COUNT=0
+OK_COUNT=0
+
+# Record a check result
+# Usage: record_result "OK|WARN|FAIL" "Check name" "Detail message" ["Fix command"]
+record_result() {
+    local status="$1" name="$2" message="$3" fix="${4:-}"
+    RESULTS+=("${status}|${name}|${message}|${fix}")
+    case "$status" in
+        OK)   OK_COUNT=$((OK_COUNT + 1)) ;;
+        WARN) WARN_COUNT=$((WARN_COUNT + 1)) ;;
+        FAIL) FAIL_COUNT=$((FAIL_COUNT + 1)) ;;
+    esac
+}
+
+# --- TTY-Aware Output ---
+setup_colors() {
+    if [ -t 1 ] && [ -t 2 ]; then
+        RED=$'\033[0;31m'
+        GREEN=$'\033[0;32m'
+        YELLOW=$'\033[1;33m'
+        BOLD=$'\033[1m'
+        NC=$'\033[0m'
+        ICON_OK='✓'
+        ICON_WARN='⚠'
+        ICON_FAIL='✗'
+    else
+        RED=''
+        GREEN=''
+        YELLOW=''
+        BOLD=''
+        NC=''
+        ICON_OK='OK'
+        ICON_WARN='WARN'
+        ICON_FAIL='FAIL'
+    fi
+}
+
+# --- Distro Detection ---
+detect_distro() {
+    if [ -f /etc/os-release ]; then
+        # shellcheck source=/dev/null
+        . /etc/os-release
+        DISTRO_ID="${ID}"
+        DISTRO_VERSION="${VERSION_ID}"
+        DISTRO_FAMILY="${ID_LIKE:-${ID}}"
+    else
+        DISTRO_ID="unknown"
+        DISTRO_VERSION="unknown"
+        DISTRO_FAMILY="unknown"
+    fi
+}
+
+# Return distro-specific install command for a given package
+get_install_cmd() {
+    local package="$1"
+    case "$DISTRO_FAMILY" in
+        *debian*|*ubuntu*) echo "sudo apt-get install -y ${package}" ;;
+        *rhel*|*fedora*|*centos*) echo "sudo dnf install -y ${package}" ;;
+        *suse*) echo "sudo zypper install -y ${package}" ;;
+        *) echo "Install '${package}' using your package manager" ;;
+    esac
+}
+
+# --- Testability Wrappers ---
+_uname_m() { uname -m; }
+_meminfo_total_kb() { awk '/^MemTotal:/ { print $2 }' /proc/meminfo; }
+_disk_available_gb() { LANG=C df -BG / | awk 'NR==2 { gsub(/G/,"",$4); print $4 }'; }
+_systemctl_exists() { command -v systemctl >/dev/null 2>&1; }
+_systemctl_is_running() { systemctl is-system-running >/dev/null 2>&1; }
+_ip_route_show() { ip route show 2>/dev/null; }
+_ip_route_show_table_all() { ip route show table all 2>/dev/null; }
+_ip_addr_show() { ip addr show 2>/dev/null; }
+_curl_exists() { command -v curl >/dev/null 2>&1; }
+_wget_exists() { command -v wget >/dev/null 2>&1; }
+_curl_check() {
+    local endpoint="$1"
+    curl -sS --connect-timeout 10 --max-time 15 "https://${endpoint}/" -o /dev/null < /dev/null
+}
+_wget_check() {
+    local endpoint="$1"
+    wget -q --timeout=15 --spider "https://${endpoint}/" 2>/dev/null < /dev/null
+}
+_getenforce_exists() { command -v getenforce >/dev/null 2>&1; }
+_getenforce() { getenforce 2>/dev/null; }
+_apparmor_loaded() { [ -d /sys/module/apparmor ]; }
+_aa_status_exists() { command -v aa-status >/dev/null 2>&1; }
+_aa_status_enabled() { aa-status --enabled 2>/dev/null; }
+_firewalld_active() { command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; }
+_ufw_exists() { command -v ufw >/dev/null 2>&1; }
+_ufw_status() { ufw status 2>/dev/null | head -1; }
+_nft_exists() { command -v nft >/dev/null 2>&1; }
+_nft_table_count() { nft list tables 2>/dev/null | wc -l; }
+_read_input() {
+    local prompt="$1" varname="$2"
+    read -rp "$prompt" "$varname"
+}
+_read_secret() {
+    local prompt="$1" varname="$2"
+    read -rsp "$prompt" "$varname"
+    echo  # newline after hidden input
+}
+_curl_registry_auth() {
+    local user="$1" pass="$2"
+    curl -sS -o /dev/null -w "%{http_code}" \
+        --connect-timeout 10 --max-time 15 \
+        -u "${user}:${pass}" \
+        "https://${REGISTRY_HOST}/v2/" < /dev/null
+}
+_curl_license_validate() {
+    local license_key="$1" api_key="$2"
+    curl -sS -o /dev/null -w "%{http_code}" \
+        --connect-timeout 10 --max-time 15 \
+        -X POST -H "Content-Type: application/json" \
+        -H "Authorization: Bearer ${api_key}" \
+        -d "{\"license_key\":\"${license_key}\"}" \
+        "https://${LICENSE_HOST}/v1/validate" < /dev/null
+}
+_mkdir_p() { mkdir -p "$1"; }
+_chmod() { chmod "$1" "$2"; }
+_write_file() {
+    local path="$1"
+    shift
+    printf '%s\n' "$@" > "$path"
+}
+_date_utc() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+_k3s_install() {
+    curl -sfL https://get.k3s.io | \
+        INSTALL_K3S_VERSION="${K3S_VERSION}" \
+        sh -s - server \
+        --disable=traefik \
+        --disable=servicelb \
+        "$@"
+}
+_kubectl() {
+    /usr/local/bin/k3s kubectl "$@"
+}
+_base64_encode() {
+    base64 -w0
+}
+_helm_package() {
+    local chart_dir="$1" output_dir="$2"
+    helm package "$chart_dir" -d "$output_dir"
+}
+_ip_route_get_1() { ip route get 1 2>/dev/null; }
+_hostname_I() { hostname -I 2>/dev/null; }
+_curl_localhost_nodeport() {
+    curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 \
+        "http://localhost:${NODEPORT}/" 2>/dev/null
+}
+_systemctl_is_active() { systemctl is-active "$1" 2>/dev/null; }
+_df_root_usage() { LANG=C df -BG / | awk 'NR==2 { print $3, $4, $5 }'; }
+_k3s_uninstall_script() { /usr/local/bin/k3s-uninstall.sh; }
+_rm_rf() { rm -rf "$1"; }
+_rm_f() { rm -f "$1"; }
+
+# --- Component Validation ---
+VALID_COMPONENTS=("scan-scheduler" "scan-manager" "chrome-controller" "redis")
+
+validate_component() {
+    local component="$1"
+    for valid in "${VALID_COMPONENTS[@]}"; do
+        if [ "$component" = "$valid" ]; then
+            return 0
+        fi
+    done
+    printf "Unknown component: %s\n" "$component"
+    printf "Valid components: %s\n" "${VALID_COMPONENTS[*]}"
+    return 1
+}
+
+require_k3s() {
+    if [ ! -x "/usr/local/bin/k3s" ]; then
+        printf "%sError: Scanner is not installed. Run 'detectify-scanner install' first.%s\n" "${RED}" "${NC}"
+        return 1
+    fi
+}
+
+# --- Management Commands ---
+status_command() {
+    require_k3s || return 1
+
+    printf "%sDetectify Scanner Status%s\n" "${BOLD}" "${NC}"
+    echo "========================"
+    echo ""
+
+    local overall_ok=true
+
+    # k3s service health
+    local k3s_status
+    k3s_status=$(_systemctl_is_active "k3s") || true
+    if [ "$k3s_status" = "active" ]; then
+        record_result "OK" "k3s service" "Running"
+    else
+        record_result "FAIL" "k3s service" "Status: ${k3s_status:-not found}" \
+            "Start k3s: sudo systemctl start k3s"
+        overall_ok=false
+    fi
+
+    # Pod health for each component
+    for component in "${EXPECTED_PODS[@]}"; do
+        local phase
+        phase=$(_kubectl get pods -n scanner -l "app=${component}" \
+            -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "NotFound")
+        if [ "$phase" = "Running" ]; then
+            record_result "OK" "${component}" "Running"
+        else
+            record_result "FAIL" "${component}" "${phase}" \
+                "Check logs: detectify-scanner logs ${component}"
+            overall_ok=false
+        fi
+    done
+
+    # API reachability (single check, no retry loop)
+    local actual_port
+    actual_port=$(_kubectl get svc scan-scheduler -n scanner -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null || echo "")
+    if [ -n "$actual_port" ] && [ "$actual_port" != "$NODEPORT" ]; then
+        NODEPORT="$actual_port"
+    fi
+    local http_code=""
+    http_code=$(_curl_localhost_nodeport) || true
+    if [ -n "$http_code" ] && [ "$http_code" != "000" ]; then
+        local server_ip
+        server_ip=$(detect_server_ip)
+        record_result "OK" "API reachability" "http://${server_ip}:${NODEPORT} responding"
+    else
+        record_result "FAIL" "API reachability" "Port ${NODEPORT} not responding" \
+            "Try: detectify-scanner restart"
+        overall_ok=false
+    fi
+
+    # Disk usage
+    local disk_info
+    disk_info=$(_df_root_usage) || true
+    record_result "OK" "Disk usage" "${disk_info}"
+
+    # Render results
+    echo ""
+    for result in "${RESULTS[@]}"; do
+        IFS='|' read -r status name message fix <<< "$result"
+        case "$status" in
+            OK)   printf "  %s[%s]%s %s: %s\n" "${GREEN}" "${ICON_OK}" "${NC}" "$name" "$message" ;;
+            WARN) printf "  %s[%s]%s %s: %s\n" "${YELLOW}" "${ICON_WARN}" "${NC}" "$name" "$message"
+                  [ -n "$fix" ] && printf "      Fix: %s\n" "$fix" ;;
+            FAIL) printf "  %s[%s]%s %s: %s\n" "${RED}" "${ICON_FAIL}" "${NC}" "$name" "$message"
+                  [ -n "$fix" ] && printf "      Fix: %s\n" "$fix" ;;
+        esac
+    done
+
+    echo ""
+    if [ "$overall_ok" = true ]; then
+        printf "%s%sAll systems healthy.%s\n" "${GREEN}" "${BOLD}" "${NC}"
+        return 0
+    else
+        printf "%s%sSome checks failed. See above for details.%s\n" "${RED}" "${BOLD}" "${NC}"
+        return 1
+    fi
+}
+
+logs_command() {
+    require_k3s || return 1
+
+    local component=""
+    local follow=false
+    local tail_lines=50
+
+    # Parse arguments
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -f|--follow) follow=true; shift ;;
+            *) component="$1"; shift ;;
+        esac
+    done
+
+    local kubectl_args=(logs -n scanner --tail="$tail_lines")
+
+    if [ -n "$component" ]; then
+        validate_component "$component" || return 1
+        kubectl_args+=(-l "app=${component}")
+    else
+        kubectl_args+=(--all-containers --prefix -l "app in (scan-scheduler,scan-manager,chrome-controller,redis)")
+    fi
+
+    if [ "$follow" = true ]; then
+        kubectl_args+=(-f)
+    fi
+
+    _kubectl "${kubectl_args[@]}"
+}
+
+restart_command() {
+    require_k3s || return 1
+
+    local component="${1:-}"
+
+    if [ -n "$component" ]; then
+        validate_component "$component" || return 1
+        printf "Restarting %s...\n" "$component"
+        _kubectl rollout restart "deployment/${component}" -n scanner || {
+            printf "%sFailed to restart %s.%s\n" "${RED}" "$component" "${NC}"
+            return 1
+        }
+        printf "  Waiting for rollout to complete...\n"
+        _kubectl rollout status "deployment/${component}" -n scanner --timeout=120s || {
+            printf "%sRollout did not complete within timeout.%s\n" "${RED}" "${NC}"
+            return 1
+        }
+    else
+        printf "Restarting all scanner components...\n"
+        for dep in "${EXPECTED_PODS[@]}"; do
+            printf "  Restarting %s...\n" "$dep"
+            _kubectl rollout restart "deployment/${dep}" -n scanner || {
+                printf "%sFailed to restart %s.%s\n" "${RED}" "$dep" "${NC}"
+                return 1
+            }
+        done
+        printf "  Waiting for rollouts to complete...\n"
+        for dep in "${EXPECTED_PODS[@]}"; do
+            _kubectl rollout status "deployment/${dep}" -n scanner --timeout=120s || {
+                printf "%sRollout of %s did not complete within timeout.%s\n" "${RED}" "$dep" "${NC}"
+                return 1
+            }
+        done
+    fi
+
+    printf "\n%s%sRestart complete.%s\n" "${GREEN}" "${BOLD}" "${NC}"
+}
+
+update_command() {
+    require_k3s || return 1
+
+    local manifest_file="${K3S_MANIFESTS_DIR}/detectify-scanner.yaml"
+    if [ ! -f "$manifest_file" ]; then
+        printf "%sError: Scanner not installed. Run 'detectify-scanner install' first.%s\n" "${RED}" "${NC}"
+        return 1
+    fi
+
+    printf "%sUpdating scanner to latest images...%s\n" "${BOLD}" "${NC}"
+
+    # Source saved credentials so generate_helm_values() can use them
+    if [ -f "$CONFIG_FILE" ]; then
+        # shellcheck source=/dev/null
+        source "$CONFIG_FILE"
+        # Refresh host globals from persisted config (overrides may differ from defaults)
+        REGISTRY_HOST="${SCANNER_REGISTRY_HOST:-$REGISTRY_HOST}"
+        LICENSE_HOST="${SCANNER_LICENSE_HOST:-$LICENSE_HOST}"
+        CONNECTOR_HOST="${SCANNER_CONNECTOR_HOST:-$CONNECTOR_HOST}"
+    else
+        printf "%sError: Config file not found at %s. Cannot update without credentials.%s\n" "${RED}" "$CONFIG_FILE" "${NC}"
+        return 1
+    fi
+
+    # Capture current image IDs for before/after comparison
+    local before=""
+    before=$(_kubectl get pods -n scanner \
+        -o jsonpath='{range .items[*]}{.spec.containers[0].name}={.status.containerStatuses[0].imageID}{"\n"}{end}' 2>/dev/null || true)
+
+    # Redeploy by rewriting HelmChart CRD manifest (triggers k3s Helm controller)
+    deploy_helm_chart || {
+        printf "%sFailed to update scanner deployment.%s\n" "${RED}" "${NC}"
+        return 1
+    }
+
+    # Wait for pods to restart with new images
+    printf "  Waiting for pods to restart with latest images...\n"
+    wait_for_pods || {
+        printf "%sPods did not become ready after update.%s\n" "${RED}" "${NC}"
+        return 1
+    }
+
+    # Show after image IDs
+    local after=""
+    after=$(_kubectl get pods -n scanner \
+        -o jsonpath='{range .items[*]}{.spec.containers[0].name}={.status.containerStatuses[0].imageID}{"\n"}{end}' 2>/dev/null || true)
+
+    if [ -n "$before" ] && [ -n "$after" ]; then
+        if [ "$before" = "$after" ]; then
+            printf "\n  Images unchanged (already running latest).\n"
+        else
+            printf "\n  Images updated successfully.\n"
+        fi
+    fi
+
+    printf "\n%s%sUpdate complete.%s\n" "${GREEN}" "${BOLD}" "${NC}"
+}
+
+uninstall_command() {
+    printf "%s%sWARNING: This will completely remove the Detectify scanner.%s\n" "${RED}" "${BOLD}" "${NC}"
+    printf "The following will be removed:\n"
+    printf "  - k3s and all Kubernetes components\n"
+    printf "  - Scanner configuration (%s)\n" "$CONFIG_DIR"
+    printf "  - Scanner data (/var/lib/rancher/)\n"
+    printf "  - This script (/usr/local/bin/detectify-scanner)\n"
+    echo ""
+    printf "Type 'uninstall' to confirm: "
+
+    local confirmation=""
+    _read_input "" confirmation
+    if [ "$confirmation" != "uninstall" ]; then
+        printf "Uninstall cancelled.\n"
+        return 1
+    fi
+
+    echo ""
+
+    # Step 1: Remove k3s (handles pods, services, systemd unit)
+    if [ -x "/usr/local/bin/k3s-uninstall.sh" ]; then
+        printf "  Removing k3s...\n"
+        _k3s_uninstall_script || {
+            printf "%sWarning: k3s uninstall script returned an error.%s\n" "${YELLOW}" "${NC}"
+        }
+    else
+        printf "  k3s-uninstall.sh not found (k3s may already be removed).\n"
+    fi
+
+    # Step 2: Remove scanner config
+    if [ -d "$CONFIG_DIR" ]; then
+        printf "  Removing scanner configuration (%s)...\n" "$CONFIG_DIR"
+        _rm_rf "$CONFIG_DIR"
+    fi
+
+    # Step 3: Remove k3s data (if k3s-uninstall.sh missed it)
+    if [ -d "/var/lib/rancher" ]; then
+        printf "  Removing k3s data (/var/lib/rancher/)...\n"
+        _rm_rf "/var/lib/rancher"
+    fi
+
+    # Step 4: Remove this script
+    printf "  Removing installer script (/usr/local/bin/detectify-scanner)...\n"
+    _rm_f "/usr/local/bin/detectify-scanner"
+
+    printf "\n%s%sUninstall complete.%s Server returned to pre-install state.\n" "${GREEN}" "${BOLD}" "${NC}"
+}
+
+reconfigure_command() {
+    require_k3s || return 1
+
+    if [ ! -f "$CONFIG_FILE" ]; then
+        printf "%sError: No existing configuration found at %s.%s\n" "${RED}" "$CONFIG_FILE" "${NC}"
+        printf "Run 'detectify-scanner install' first.\n"
+        return 1
+    fi
+
+    # Load current config
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+    # Refresh host globals from persisted config (overrides may differ from defaults)
+    REGISTRY_HOST="${SCANNER_REGISTRY_HOST:-$REGISTRY_HOST}"
+    LICENSE_HOST="${SCANNER_LICENSE_HOST:-$LICENSE_HOST}"
+    CONNECTOR_HOST="${SCANNER_CONNECTOR_HOST:-$CONNECTOR_HOST}"
+
+    # Save originals for diff display (Pitfall 1: variable scope)
+    local old_license="$SCANNER_LICENSE_KEY"
+    local old_connector="$SCANNER_CONNECTOR_API_KEY"
+    local old_reg_user="$SCANNER_REGISTRY_USER"
+    local old_reg_pass="$SCANNER_REGISTRY_PASS"
+
+    # Preserve infrastructure values for persist_config (Pitfall 7: CIDR globals)
+    SELECTED_CLUSTER_CIDR="${CLUSTER_CIDR}"
+    SELECTED_SERVICE_CIDR="${SERVICE_CIDR}"
+
+    # Preserve original install timestamp (Pitfall 6: timestamp overwrite)
+    local saved_timestamp="$INSTALL_TIMESTAMP"
+
+    printf "%sReconfigure Detectify Scanner%s\n\n" "${BOLD}" "${NC}"
+    printf "Current configuration:\n"
+    display_config_summary
+    printf "\nPress Enter to keep current value, or type a new one.\n\n"
+
+    # Prompt for all four credentials with defaults (per D-06)
+    prompt_with_default "License key" "$old_license" SCANNER_LICENSE_KEY false
+    prompt_with_default "Connector API key" "$old_connector" SCANNER_CONNECTOR_API_KEY false
+    prompt_with_default "Registry username" "$old_reg_user" SCANNER_REGISTRY_USER false
+    prompt_with_default "Registry password" "$old_reg_pass" SCANNER_REGISTRY_PASS true
+
+    # Validate changed credentials only (per D-07, D-08; Pitfall 3: skip unchanged)
+    if [ "$SCANNER_LICENSE_KEY" != "$old_license" ]; then
+        if ! validate_license_key_format "$SCANNER_LICENSE_KEY"; then
+            printf "%sInvalid license key format. Must be at least 8 alphanumeric/dash characters.%s\n" "${RED}" "${NC}"
+            return 1
+        fi
+    fi
+    if [ "$SCANNER_CONNECTOR_API_KEY" != "$old_connector" ]; then
+        if [ -z "$SCANNER_CONNECTOR_API_KEY" ]; then
+            printf "%sConnector API key cannot be empty.%s\n" "${RED}" "${NC}"
+            return 1
+        fi
+    fi
+    if [ "$SCANNER_REGISTRY_USER" != "$old_reg_user" ] || \
+       [ "$SCANNER_REGISTRY_PASS" != "$old_reg_pass" ]; then
+        printf "Validating registry credentials...\n"
+        validate_registry_credentials "$SCANNER_REGISTRY_USER" "$SCANNER_REGISTRY_PASS" || {
+            printf "%sRegistry credential validation failed. Credentials not applied.%s\n" "${RED}" "${NC}"
+            return 1
+        }
+    fi
+
+    # Show diff and confirm (per D-10)
+    show_changes_and_confirm \
+        "$old_license" "$SCANNER_LICENSE_KEY" \
+        "$old_connector" "$SCANNER_CONNECTOR_API_KEY" \
+        "$old_reg_user" "$SCANNER_REGISTRY_USER" \
+        "$old_reg_pass" "$SCANNER_REGISTRY_PASS" || {
+        printf "No changes to apply.\n"
+        return 0
+    }
+
+    # Apply changes in order (per D-11)
+    printf "\n%sApplying changes...%s\n" "${BOLD}" "${NC}"
+
+    # Preserve install timestamp by temporarily overriding _date_utc (Pitfall 6)
+    _date_utc() { echo "$saved_timestamp"; }
+
+    # Step 1: Update scanner.env
+    printf "  Updating configuration...\n"
+    persist_config
+
+    # Restore _date_utc with known-safe body (avoids eval of captured function)
+    _date_utc() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+
+    # Step 2: Update registries.yaml (only if registry creds changed)
+    if [ "$SCANNER_REGISTRY_USER" != "$old_reg_user" ] || \
+       [ "$SCANNER_REGISTRY_PASS" != "$old_reg_pass" ]; then
+        printf "  Updating registry authentication...\n"
+        write_registries_yaml
+    fi
+
+    # Step 3: Regenerate HelmChart CRD
+    printf "  Updating scanner deployment...\n"
+    deploy_helm_chart || {
+        printf "%sFailed to update deployment. Run 'detectify-scanner restart' to retry.%s\n" "${RED}" "${NC}"
+        return 1
+    }
+
+    # Step 4: Restart pods to pick up new config
+    printf "  Restarting scanner pods...\n"
+    restart_command || {
+        printf "%sPod restart failed. Run 'detectify-scanner restart' to retry.%s\n" "${RED}" "${NC}"
+        return 1
+    }
+
+    # Wait for pods to be healthy
+    wait_for_pods || {
+        printf "%sPods did not become ready. Run 'detectify-scanner status' to check.%s\n" "${RED}" "${NC}"
+        return 1
+    }
+
+    printf "\n%s%sReconfiguration complete.%s\n" "${GREEN}" "${BOLD}" "${NC}"
+}
+
+# --- Validation Functions ---
+validate_license_key_format() {
+    local key="$1"
+    # Non-empty, alphanumeric + hyphens, at least 8 chars (per D-04)
+    if [ -z "$key" ]; then
+        return 1
+    fi
+    if ! echo "$key" | grep -qE '^[a-zA-Z0-9-]{8,}$'; then
+        return 1
+    fi
+    return 0
+}
+
+validate_registry_credentials() {
+    local user="$1" pass="$2"
+    local http_code
+    http_code=$(_curl_registry_auth "$user" "$pass")
+    if [ "$http_code" = "200" ]; then
+        return 0  # Valid
+    elif [ "$http_code" = "401" ]; then
+        return 1  # Invalid credentials
+    else
+        return 2  # Network/unexpected error
+    fi
+}
+
+# --- Credential Prompting ---
+prompt_credentials() {
+    printf "\n%sCredential Collection%s\n" "${BOLD}" "${NC}"
+    echo "====================="
+    echo ""
+
+    # License key (per D-01, D-04)
+    _read_input "License key: " SCANNER_LICENSE_KEY
+    if ! validate_license_key_format "$SCANNER_LICENSE_KEY"; then
+        printf "\n%sError: Invalid license key format.%s\n" "${RED}" "${NC}"
+        printf "Expected: alphanumeric string (hyphens allowed), at least 8 characters.\n"
+        printf "Check your license key at https://detectify.com\n"
+        return 1
+    fi
+    record_result "OK" "License key" "Format validated"
+
+    # Connector API key (per D-01)
+    _read_input "Connector API key: " SCANNER_CONNECTOR_API_KEY
+    if [ -z "$SCANNER_CONNECTOR_API_KEY" ]; then
+        printf "\n%sError: Connector API key cannot be empty.%s\n" "${RED}" "${NC}"
+        printf "Find your connector API key at https://detectify.com\n"
+        return 1
+    fi
+    record_result "OK" "Connector API key" "Provided"
+
+    # Validate license key + API key against the license server
+    printf "Validating license key and API key...\n"
+    local license_http_code
+    license_http_code=$(_curl_license_validate "$SCANNER_LICENSE_KEY" "$SCANNER_CONNECTOR_API_KEY") || true
+    if [ "$license_http_code" = "200" ]; then
+        record_result "OK" "License validation" "License key and API key validated"
+    elif [ "$license_http_code" = "401" ]; then
+        printf "\n%sError: Invalid connector API key.%s\n" "${RED}" "${NC}"
+        printf "The API key was rejected by the license server.\n"
+        printf "Check your connector API key at https://detectify.com\n"
+        return 1
+    elif [ "$license_http_code" = "400" ]; then
+        printf "\n%sError: Invalid license key.%s\n" "${RED}" "${NC}"
+        printf "The license key was not found on the license server.\n"
+        printf "Check your license key at https://detectify.com\n"
+        return 1
+    else
+        printf "%sWarning: Could not reach license server (HTTP %s). Skipping validation.%s\n" "${YELLOW}" "$license_http_code" "${NC}"
+        record_result "WARN" "License validation" "Could not reach ${LICENSE_HOST} (HTTP ${license_http_code})"
+    fi
+
+    # Registry credentials with retry (per D-01, D-02, D-03)
+    local attempts=0
+    while [ "$attempts" -lt "$MAX_REGISTRY_ATTEMPTS" ]; do
+        _read_input "Registry username: " SCANNER_REGISTRY_USER
+        _read_secret "Registry password: " SCANNER_REGISTRY_PASS
+
+        local result=0
+        validate_registry_credentials "$SCANNER_REGISTRY_USER" "$SCANNER_REGISTRY_PASS" || result=$?
+
+        if [ "$result" -eq 0 ]; then
+            record_result "OK" "Registry credentials" "Validated against ${REGISTRY_HOST}"
+            return 0
+        fi
+
+        attempts=$((attempts + 1))
+        if [ "$result" -eq 1 ]; then
+            if [ "$attempts" -lt "$MAX_REGISTRY_ATTEMPTS" ]; then
+                printf "%sInvalid registry credentials. Attempt %d of %d.%s\n" \
+                    "${YELLOW}" "$attempts" "$MAX_REGISTRY_ATTEMPTS" "${NC}"
+            fi
+        else
+            printf "\n%sError: Unexpected error contacting %s.%s\n" "${RED}" "${REGISTRY_HOST}" "${NC}"
+            printf "Check network connectivity to https://%s\n" "${REGISTRY_HOST}"
+            return 1
+        fi
+    done
+
+    printf "\n%sError: Registry credential validation failed after %d attempts.%s\n" "${RED}" "$MAX_REGISTRY_ATTEMPTS" "${NC}"
+    printf "Verify your registry credentials at https://detectify.com/settings\n"
+    return 1
+}
+
+# --- Config Persistence ---
+persist_config() {
+    _mkdir_p "$CONFIG_DIR"
+    _chmod 700 "$CONFIG_DIR"
+
+    local timestamp
+    timestamp=$(_date_utc)
+
+    _write_file "$CONFIG_FILE" \
+        "# Detectify Scanner Configuration" \
+        "# Generated: ${timestamp}" \
+        "SCANNER_LICENSE_KEY='${SCANNER_LICENSE_KEY//\'/\'\\\'\'}'" \
+        "SCANNER_CONNECTOR_API_KEY='${SCANNER_CONNECTOR_API_KEY//\'/\'\\\'\'}'" \
+        "SCANNER_REGISTRY_USER='${SCANNER_REGISTRY_USER//\'/\'\\\'\'}'" \
+        "SCANNER_REGISTRY_PASS='${SCANNER_REGISTRY_PASS//\'/\'\\\'\'}'" \
+        "SCANNER_REGISTRY_HOST='${REGISTRY_HOST}'" \
+        "SCANNER_LICENSE_HOST='${LICENSE_HOST}'" \
+        "SCANNER_CONNECTOR_HOST='${CONNECTOR_HOST}'" \
+        "SCANNER_IMAGE_TAG='${SCANNER_IMAGE_TAG:-stable}'" \
+        "NODEPORT='${NODEPORT}'" \
+        "K3S_VERSION='${K3S_VERSION}'" \
+        "CLUSTER_CIDR='${SELECTED_CLUSTER_CIDR}'" \
+        "SERVICE_CIDR='${SELECTED_SERVICE_CIDR}'" \
+        "INSTALL_TIMESTAMP='${timestamp}'"
+
+    _chmod 600 "$CONFIG_FILE"
+    record_result "OK" "Config persistence" "Saved to ${CONFIG_FILE}"
+}
+
+# --- Registry Auth (must run BEFORE k3s install) ---
+write_registries_yaml() {
+    local user="${SCANNER_REGISTRY_USER}"
+    local pass="${SCANNER_REGISTRY_PASS}"
+
+    _mkdir_p "$(dirname "$K3S_REGISTRIES_YAML")"
+
+    # Use single-quoted YAML strings to avoid interpretation of special chars.
+    # Escape single quotes within values by doubling them (YAML spec).
+    user="${user//\'/\'\'}"
+    pass="${pass//\'/\'\'}"
+
+    cat > "$K3S_REGISTRIES_YAML" <<REGEOF
+mirrors:
+  ${REGISTRY_HOST}:
+    endpoint:
+      - "https://${REGISTRY_HOST}"
+configs:
+  "${REGISTRY_HOST}":
+    auth:
+      username: '${user}'
+      password: '${pass}'
+REGEOF
+
+    _chmod 600 "$K3S_REGISTRIES_YAML"
+    record_result "OK" "Registry auth" "Configured containerd registry auth at ${K3S_REGISTRIES_YAML}"
+}
+
+# --- k3s Installation ---
+install_k3s() {
+    local -a extra_args=()
+
+    # CIDR overrides from Phase 1 (per D-08)
+    if [ -n "$SELECTED_CLUSTER_CIDR" ] && \
+       [ "$SELECTED_CLUSTER_CIDR" != "$K3S_DEFAULT_CLUSTER_CIDR" ]; then
+        extra_args+=("--cluster-cidr=${SELECTED_CLUSTER_CIDR}")
+    fi
+    if [ -n "$SELECTED_SERVICE_CIDR" ] && \
+       [ "$SELECTED_SERVICE_CIDR" != "$K3S_DEFAULT_SERVICE_CIDR" ]; then
+        extra_args+=("--service-cidr=${SELECTED_SERVICE_CIDR}")
+    fi
+
+    printf "\n%sInstalling k3s %s%s\n" "${BOLD}" "${K3S_VERSION}" "${NC}"
+    if _k3s_install "${extra_args[@]}"; then
+        record_result "OK" "k3s installation" "k3s ${K3S_VERSION} installed successfully"
+    else
+        printf "%sError: k3s installation failed.%s\n" "${RED}" "${NC}"
+        printf "Check internet connectivity and try again. Logs: journalctl -u k3s\n"
+        return 1
+    fi
+}
+
+# --- Helm Chart Deployment ---
+generate_helm_values() {
+    local image_tag="${SCANNER_IMAGE_TAG:-stable}"
+    cat <<VALEOF
+secrets:
+  licenseKey: "${SCANNER_LICENSE_KEY}"
+  connectorApiKey: "${SCANNER_CONNECTOR_API_KEY}"
+  registry:
+    username: "${SCANNER_REGISTRY_USER}"
+    password: "${SCANNER_REGISTRY_PASS}"
+registry:
+  url: "${REGISTRY_HOST}/internal-scanning"
+  server: "${REGISTRY_HOST}"
+images:
+  scanScheduler:
+    tag: "${image_tag}"
+  scanManager:
+    tag: "${image_tag}"
+  chromeController:
+    tag: "${image_tag}"
+  scanWorker:
+    tag: "${image_tag}"
+  chromeContainer:
+    tag: "${image_tag}"
+config:
+  licenseServerUrl: "https://${LICENSE_HOST}"
+  connectorServerUrl: "https://${CONNECTOR_HOST}"
+  chromeContainerTag: "${image_tag}"
+  logFormat: text
+service:
+  type: NodePort
+  nodePort: ${NODEPORT}
+redis:
+  persistence:
+    enabled: true
+    size: 8Gi
+VALEOF
+}
+
+deploy_helm_chart() {
+    local manifest_file="${K3S_MANIFESTS_DIR}/detectify-scanner.yaml"
+    local chart_content=""
+
+    # Embed chart as base64 tarball
+    if [ -n "${EMBEDDED_CHART_CONTENT:-}" ]; then
+        chart_content="$EMBEDDED_CHART_CONTENT"
+    elif [ -d "helm-charts/internal-scanning-agent" ]; then
+        local tmp_dir
+        tmp_dir=$(mktemp -d)
+        _helm_package "helm-charts/internal-scanning-agent" "$tmp_dir"
+        local -a tgz_files=("$tmp_dir"/internal-scanning-agent-*.tgz)
+        if [ ${#tgz_files[@]} -ne 1 ] || [ ! -f "${tgz_files[0]}" ]; then
+            printf "%sError: helm package did not produce expected .tgz file.%s\n" "${RED}" "${NC}"
+            printf "Check helm-charts/internal-scanning-agent/ Chart.yaml and templates.\n"
+            rm -rf "$tmp_dir"
+            return 1
+        fi
+        chart_content=$(_base64_encode < "${tgz_files[0]}")
+        rm -rf "$tmp_dir"
+    else
+        local chart_version="${CHART_VERSION:-}"
+        local chart_repo="https://raw.githubusercontent.com/detectify/helm-charts/gh-pages"
+
+        if [ -z "$chart_version" ]; then
+            printf "Fetching latest chart version...\n"
+            chart_version=$(curl -sSfL "${chart_repo}/index.yaml" \
+                | awk '/name: internal-scanning-agent/{found=1} found && /version:/{print $2; exit}')
+            if [ -z "$chart_version" ]; then
+                printf "%sError: Could not determine latest chart version from %s/index.yaml.%s\n" "${RED}" "${chart_repo}" "${NC}"
+                printf "Set CHART_VERSION explicitly or provide EMBEDDED_CHART_CONTENT.\n"
+                return 1
+            fi
+        fi
+
+        local chart_url="${chart_repo}/internal-scanning-agent-${chart_version}.tgz"
+        printf "Downloading chart v%s from %s\n" "$chart_version" "$chart_url"
+        local tmp_tgz
+        tmp_tgz=$(mktemp /tmp/chart-XXXXXX.tgz)
+        if ! curl -sSfL -o "$tmp_tgz" "$chart_url"; then
+            printf "%sError: Failed to download chart from %s.%s\n" "${RED}" "${chart_url}" "${NC}"
+            printf "Check network connectivity or set CHART_VERSION to a valid version.\n"
+            rm -f "$tmp_tgz"
+            return 1
+        fi
+        chart_content=$(_base64_encode < "$tmp_tgz")
+        export EMBEDDED_CHART_CONTENT="$chart_content"
+        rm -f "$tmp_tgz"
+        printf "Chart v%s downloaded and embedded.\n" "$chart_version"
+    fi
+
+    local values_content
+    values_content=$(generate_helm_values)
+
+    _mkdir_p "$K3S_MANIFESTS_DIR"
+
+    # HelmChart CRD: namespace MUST be kube-system (k3s requirement)
+    cat > "$manifest_file" <<HELMEOF
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: internal-scanning-agent
+  namespace: kube-system
+spec:
+  chartContent: ${chart_content}
+  targetNamespace: scanner
+  createNamespace: true
+  timeout: 300s
+  valuesContent: |-
+$(echo "$values_content" | sed 's/^/    /')
+HELMEOF
+
+    # T-02-09 mitigation: restrict manifest file permissions (contains credentials)
+    _chmod 600 "$manifest_file"
+    record_result "OK" "Helm chart" "Deployed HelmChart CRD to ${manifest_file}"
+}
+
+# --- Pod Readiness ---
+wait_for_api_server() {
+    local elapsed=0
+    printf "  Waiting for k3s API server..."
+    while [ "$elapsed" -lt "$API_SERVER_TIMEOUT" ]; do
+        if _kubectl cluster-info >/dev/null 2>&1; then
+            printf " ready.\n"
+            return 0
+        fi
+        sleep 5
+        elapsed=$((elapsed + 5))
+        printf "."
+    done
+    printf "\n"
+    printf "%sError: k3s API server not ready after %d seconds.%s\n" "${RED}" "$API_SERVER_TIMEOUT" "${NC}"
+    printf "Check k3s logs: journalctl -u k3s\n"
+    return 1
+}
+
+wait_for_pods() {
+    printf "\n%sWaiting for scanner pods%s\n" "${BOLD}" "${NC}"
+
+    # First wait for API server (per Research Pitfall 7)
+    if ! wait_for_api_server; then
+        return 1
+    fi
+
+    local elapsed=0
+    while [ "$elapsed" -lt "$READINESS_TIMEOUT" ]; do
+        local all_ready=true
+        local status_line=""
+
+        for pod_prefix in "${EXPECTED_PODS[@]}"; do
+            local phase
+            phase=$(_kubectl get pods -n scanner -l "app=${pod_prefix}" \
+                -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "NotFound")
+            status_line="${status_line} ${pod_prefix}=${phase}"
+            if [ "$phase" != "Running" ]; then
+                all_ready=false
+            fi
+        done
+
+        if [ "$all_ready" = true ]; then
+            printf "\r  All pods running:${status_line}                    \n"
+            record_result "OK" "Pod readiness" "All scanner pods running in namespace scanner"
+            return 0
+        fi
+
+        printf "\r  Waiting for pods (%ds/%ds):${status_line}    " "$elapsed" "$READINESS_TIMEOUT"
+        sleep "$POLL_INTERVAL"
+        elapsed=$((elapsed + POLL_INTERVAL))
+    done
+
+    printf "\n"
+    printf "%sError: Not all pods ready after %ds.%s\n" "${RED}" "$READINESS_TIMEOUT" "${NC}"
+    printf "Check pod status: /usr/local/bin/k3s kubectl get pods -n scanner\n"
+    return 1
+}
+
+# --- IP Detection and API Verification ---
+detect_server_ip() {
+    local ip=""
+    # Method 1: ip route get (most reliable -- finds source IP for outbound traffic)
+    ip=$(_ip_route_get_1 | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1)
+
+    # Method 2: fallback to hostname -I (space-separated list of all IPs)
+    if [ -z "$ip" ]; then
+        ip=$(_hostname_I | awk '{print $1}')
+    fi
+
+    # Method 3: parse ip addr for first non-loopback IPv4
+    if [ -z "$ip" ]; then
+        ip=$(_ip_addr_show | awk '/inet / && !/127.0.0.1/ {split($2,a,"/"); print a[1]; exit}')
+    fi
+
+    echo "$ip"
+}
+
+verify_api_reachability() {
+    printf "\n%sVerifying scanner API reachability%s\n" "${BOLD}" "${NC}"
+
+    local actual_port
+    actual_port=$(_kubectl get svc scan-scheduler -n scanner -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null || echo "")
+    if [ -n "$actual_port" ] && [ "$actual_port" != "$NODEPORT" ]; then
+        NODEPORT="$actual_port"
+    fi
+
+    local elapsed=0
+    local timeout=120
+    local interval=5
+
+    while [ "$elapsed" -lt "$timeout" ]; do
+        local http_code=""
+        http_code=$(_curl_localhost_nodeport) || true
+        if [ -n "$http_code" ] && [ "$http_code" != "000" ]; then
+            record_result "OK" "API reachability" \
+                "Scanner API responding on port ${NODEPORT}"
+
+            local server_ip
+            server_ip=$(detect_server_ip)
+            if [ -n "$server_ip" ]; then
+                printf "\n  %sScanner API: http://%s:%s%s\n" \
+                    "${GREEN}" "$server_ip" "$NODEPORT" "${NC}"
+            fi
+            return 0
+        fi
+
+        printf "\r  Waiting for API (%ds/%ds)..." "$elapsed" "$timeout"
+        sleep "$interval"
+        elapsed=$((elapsed + interval))
+    done
+
+    printf "%sError: Scanner API not responding on port %s after %ds.%s\n" "${RED}" "$NODEPORT" "$timeout" "${NC}"
+    printf "Check: 1) Pod logs: /usr/local/bin/k3s kubectl logs -n scanner -l app=scan-scheduler\n"
+    printf "       2) Service: /usr/local/bin/k3s kubectl get svc -n scanner\n"
+    printf "       3) Firewall: ensure port %s is open\n" "$NODEPORT"
+    return 1
+}
+
+# --- Checks ---
+check_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        record_result "WARN" "Root privileges" \
+            "Not running as root. Some checks may be incomplete and installation requires root." \
+            "Re-run with: sudo $0 $*"
+    else
+        record_result "OK" "Root privileges" "Running as root"
+    fi
+}
+
+check_architecture() {
+    local arch
+    arch=$(_uname_m)
+    if [ "$arch" != "x86_64" ]; then
+        record_result "FAIL" "Architecture" \
+            "Detected architecture: ${arch}. Only x86_64 is supported." \
+            "Use an x86_64/amd64 server. ARM is not supported (Chrome has no ARM Linux builds)."
+    else
+        record_result "OK" "Architecture" \
+            "Architecture: x86_64"
+    fi
+}
+
+check_resources() {
+    # RAM check
+    local ram_kb ram_mb
+    ram_kb=$(_meminfo_total_kb)
+    ram_mb=$((ram_kb / 1024))
+    if [ "$ram_mb" -lt "$HARD_MIN_RAM_MB" ]; then
+        record_result "FAIL" "RAM" \
+            "Detected ${ram_mb}MB RAM. Minimum required: ${HARD_MIN_RAM_MB}MB." \
+            "Add more RAM or use a larger instance type. Minimum: 4GB, recommended: 8GB."
+    elif [ "$ram_mb" -lt "$SOFT_REC_RAM_MB" ]; then
+        record_result "WARN" "RAM" \
+            "Detected ${ram_mb}MB RAM. Recommended: ${SOFT_REC_RAM_MB}MB." \
+            "Consider upgrading to at least 8GB RAM for optimal performance."
+    else
+        record_result "OK" "RAM" \
+            "Detected ${ram_mb}MB RAM (meets recommended ${SOFT_REC_RAM_MB}MB)"
+    fi
+
+    # Disk check
+    local disk_gb
+    disk_gb=$(_disk_available_gb)
+    if [ "$disk_gb" -lt "$HARD_MIN_DISK_GB" ]; then
+        record_result "FAIL" "Disk" \
+            "Detected ${disk_gb}GB available disk space. Minimum required: ${HARD_MIN_DISK_GB}GB." \
+            "Free up disk space or expand the filesystem. Minimum: 20GB, recommended: 50GB."
+    elif [ "$disk_gb" -lt "$SOFT_REC_DISK_GB" ]; then
+        record_result "WARN" "Disk" \
+            "Detected ${disk_gb}GB available disk space. Recommended: ${SOFT_REC_DISK_GB}GB." \
+            "Consider expanding the filesystem for optimal performance."
+    else
+        record_result "OK" "Disk" \
+            "Detected ${disk_gb}GB available disk space (meets recommended ${SOFT_REC_DISK_GB}GB)"
+    fi
+}
+
+check_systemd() {
+    if ! _systemctl_exists; then
+        record_result "FAIL" "Systemd" \
+            "systemctl not found. This installer requires systemd." \
+            "This installer requires a Linux distribution with systemd (e.g., Ubuntu 22.04+, RHEL 9+, Debian 12+)."
+    elif ! _systemctl_is_running; then
+        record_result "WARN" "Systemd" \
+            "systemd is installed but not fully running." \
+            "Check systemd status with: systemctl is-system-running"
+    else
+        record_result "OK" "Systemd" \
+            "systemd is active and running"
+    fi
+}
+
+# --- CIDR Conflict Detection ---
+SELECTED_CLUSTER_CIDR=""
+SELECTED_SERVICE_CIDR=""
+
+# --- Credential Globals ---
+SCANNER_LICENSE_KEY=""
+SCANNER_CONNECTOR_API_KEY=""
+SCANNER_REGISTRY_USER=""
+SCANNER_REGISTRY_PASS=""
+
+cidr_conflicts() {
+    local cidr="$1"
+    # NOTE: Only supports /16 CIDRs in the 10.x.0.0/16 range
+    local first="${cidr%%.*}"             # e.g., "10" from "10.42.0.0/16"
+    local rest="${cidr#*.}"
+    local second="${rest%%.*}"            # e.g., "42" from "10.42.0.0/16"
+    local pattern="${first}\.${second}\."
+    # Check ip route for overlapping entries
+    _ip_route_show | grep -qE "^${pattern}" && return 0
+    _ip_route_show_table_all | grep -qE " ${pattern}" && return 0
+    # Check ip addr for interface addresses in this range
+    _ip_addr_show | grep -qE "inet ${pattern}" && return 0
+    return 1
+}
+
+find_alternative_cidr() {
+    local default_cidr="$1"
+    local exclude="${2:-}"
+    # Try alternatives: 244, 245, 246, 247, 248, 249
+    for octet in 244 245 246 247 248 249; do
+        local candidate="10.${octet}.0.0/16"
+        [ "$candidate" = "$exclude" ] && continue
+        if ! cidr_conflicts "$candidate"; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 1  # All alternatives conflict
+}
+
+check_cidr() {
+    # Check cluster CIDR (default: 10.42.0.0/16)
+    if cidr_conflicts "$K3S_DEFAULT_CLUSTER_CIDR"; then
+        local alt_cluster
+        alt_cluster=$(find_alternative_cidr "$K3S_DEFAULT_CLUSTER_CIDR" || true)
+        if [ -n "$alt_cluster" ]; then
+            SELECTED_CLUSTER_CIDR="$alt_cluster"
+            record_result "WARN" "Cluster CIDR" \
+                "Default ${K3S_DEFAULT_CLUSTER_CIDR} conflicts with existing routes. Will use ${alt_cluster} instead." \
+                "No action needed. Alternative CIDR selected automatically."
+        else
+            record_result "FAIL" "Cluster CIDR" \
+                "Default ${K3S_DEFAULT_CLUSTER_CIDR} conflicts and no alternative found in 10.{244-249}.0.0/16 range." \
+                "Free up a /16 network range or manually specify --cluster-cidr during k3s installation."
+        fi
+    else
+        SELECTED_CLUSTER_CIDR="$K3S_DEFAULT_CLUSTER_CIDR"
+        record_result "OK" "Cluster CIDR" \
+            "Using default ${K3S_DEFAULT_CLUSTER_CIDR} (no conflicts detected)"
+    fi
+
+    # Check service CIDR (default: 10.43.0.0/16)
+    if cidr_conflicts "$K3S_DEFAULT_SERVICE_CIDR"; then
+        local alt_service
+        alt_service=$(find_alternative_cidr "$K3S_DEFAULT_SERVICE_CIDR" "$SELECTED_CLUSTER_CIDR" || true)
+        if [ -n "$alt_service" ]; then
+            SELECTED_SERVICE_CIDR="$alt_service"
+            record_result "WARN" "Service CIDR" \
+                "Default ${K3S_DEFAULT_SERVICE_CIDR} conflicts with existing routes. Will use ${alt_service} instead." \
+                "No action needed. Alternative CIDR selected automatically."
+        else
+            record_result "FAIL" "Service CIDR" \
+                "Default ${K3S_DEFAULT_SERVICE_CIDR} conflicts and no alternative found in 10.{244-249}.0.0/16 range." \
+                "Free up a /16 network range or manually specify --service-cidr during k3s installation."
+        fi
+    else
+        SELECTED_SERVICE_CIDR="$K3S_DEFAULT_SERVICE_CIDR"
+        record_result "OK" "Service CIDR" \
+            "Using default ${K3S_DEFAULT_SERVICE_CIDR} (no conflicts detected)"
+    fi
+}
+
+check_connectivity() {
+    if _curl_exists; then
+        for endpoint in "${REQUIRED_ENDPOINTS[@]}"; do
+            local exit_code=0
+            _curl_check "$endpoint" || exit_code=$?
+            if [ "$exit_code" -eq 0 ]; then
+                record_result "OK" "Connectivity: ${endpoint}" \
+                    "Successfully reached https://${endpoint}"
+            elif [ "$exit_code" -eq 60 ]; then
+                record_result "FAIL" "Connectivity: ${endpoint}" \
+                    "TLS/SSL error connecting to https://${endpoint}. CA certificates may be missing or outdated." \
+                    "$(get_install_cmd ca-certificates) && update-ca-certificates. Test with: curl -v https://${endpoint}"
+            else
+                record_result "FAIL" "Connectivity: ${endpoint}" \
+                    "Cannot reach https://${endpoint} (curl exit code: ${exit_code})" \
+                    "Check DNS resolution, firewall rules, and proxy settings. Test with: curl -v https://${endpoint}"
+            fi
+        done
+    elif _wget_exists; then
+        for endpoint in "${REQUIRED_ENDPOINTS[@]}"; do
+            if _wget_check "$endpoint"; then
+                record_result "OK" "Connectivity: ${endpoint}" \
+                    "Successfully reached https://${endpoint}"
+            else
+                record_result "FAIL" "Connectivity: ${endpoint}" \
+                    "Cannot reach https://${endpoint}" \
+                    "Check DNS resolution, firewall rules, and proxy settings."
+            fi
+        done
+    else
+        record_result "FAIL" "Connectivity tools" \
+            "Neither curl nor wget found. Cannot verify network connectivity." \
+            "$(get_install_cmd curl)"
+    fi
+}
+
+preflight_checks() {
+    check_root
+    check_architecture
+    check_resources
+    check_systemd
+    check_cidr
+    check_connectivity
+    check_security_frameworks
+}
+
+check_security_frameworks() {
+    # SELinux -- per D-09: warn, don't block. Per Pitfall 5: only warn on Enforcing.
+    if _getenforce_exists; then
+        local selinux_status
+        selinux_status=$(_getenforce)
+        if [ "$selinux_status" = "Enforcing" ]; then
+            record_result "WARN" "SELinux" \
+                "SELinux is in Enforcing mode. k3s will install the k3s-selinux policy package automatically." \
+                "No action needed. If issues occur: sudo setenforce 0 (temporary) or edit /etc/selinux/config (permanent)"
+        else
+            record_result "OK" "SELinux" \
+                "SELinux status: ${selinux_status}"
+        fi
+    fi
+
+    # AppArmor
+    if _apparmor_loaded; then
+        local apparmor_status="loaded"
+        if _aa_status_exists; then
+            _aa_status_enabled && apparmor_status="enabled" || apparmor_status="loaded but not enforcing"
+        fi
+        record_result "OK" "AppArmor" \
+            "AppArmor is ${apparmor_status}. k3s handles AppArmor profiles automatically."
+    fi
+
+    # Firewalld
+    if _firewalld_active; then
+        record_result "WARN" "Firewalld" \
+            "firewalld is active. k3s requires ports 6443/tcp, 8472/udp, 10250/tcp, and pod/service CIDR traffic." \
+            "k3s manages iptables rules directly. If issues occur: sudo firewall-cmd --add-port=6443/tcp --permanent && sudo firewall-cmd --add-port=8472/udp --permanent && sudo firewall-cmd --add-port=10250/tcp --permanent && sudo firewall-cmd --reload"
+    fi
+
+    # UFW
+    if _ufw_exists; then
+        local ufw_status
+        ufw_status=$(_ufw_status)
+        if echo "$ufw_status" | grep -qi "^Status: active" && ! echo "$ufw_status" | grep -qi "inactive"; then
+            record_result "WARN" "UFW" \
+                "UFW is active. k3s requires ports 6443/tcp, 8472/udp, 10250/tcp." \
+                "sudo ufw allow 6443/tcp && sudo ufw allow 8472/udp && sudo ufw allow 10250/tcp"
+        fi
+    fi
+
+    # nftables
+    if _nft_exists; then
+        local table_count
+        table_count=$(_nft_table_count)
+        if [ "$table_count" -gt 0 ] 2>/dev/null; then
+            record_result "WARN" "nftables" \
+                "nftables is active with ${table_count} table(s). k3s uses iptables; ensure iptables-nft compatibility." \
+                "Most modern distros use iptables-nft (iptables backed by nftables) which is compatible with k3s."
+        fi
+    fi
+}
+
+# --- Report Rendering ---
+render_report() {
+    echo ""
+    printf "%sPre-flight Check Results%s\n" "${BOLD}" "${NC}"
+    echo "========================"
+    echo ""
+
+    for result in "${RESULTS[@]}"; do
+        IFS='|' read -r status name message fix <<< "$result"
+        case "$status" in
+            OK)   printf "  %s[%s]%s %s: %s\n" "${GREEN}" "${ICON_OK}" "${NC}" "$name" "$message" ;;
+            WARN) printf "  %s[%s]%s %s: %s\n" "${YELLOW}" "${ICON_WARN}" "${NC}" "$name" "$message"
+                  [ -n "$fix" ] && printf "      Fix: %s\n" "$fix" ;;
+            FAIL) printf "  %s[%s]%s %s: %s\n" "${RED}" "${ICON_FAIL}" "${NC}" "$name" "$message"
+                  [ -n "$fix" ] && printf "      Fix: %s\n" "$fix" ;;
+        esac
+    done
+
+    echo ""
+    printf "Summary: %s%d passed%s, %s%d warning(s)%s, %s%d failed%s\n" \
+        "${GREEN}" "$OK_COUNT" "${NC}" \
+        "${YELLOW}" "$WARN_COUNT" "${NC}" \
+        "${RED}" "$FAIL_COUNT" "${NC}"
+
+    if [ "$FAIL_COUNT" -gt 0 ]; then
+        echo ""
+        printf "%s%sPre-flight checks failed. Please resolve the issues above before installing.%s\n" "${RED}" "${BOLD}" "${NC}"
+        return 1
+    elif [ "$WARN_COUNT" -gt 0 ]; then
+        echo ""
+        printf "%sPre-flight checks passed with warnings. Installation will proceed.%s\n" "${YELLOW}" "${NC}"
+        return 0
+    else
+        echo ""
+        printf "%sAll pre-flight checks passed.%s\n" "${GREEN}" "${NC}"
+        return 0
+    fi
+}
+
+# --- Helper Functions (shared by install guard and reconfigure) ---
+
+mask_value() {
+    local val="$1"
+    local len=${#val}
+    if [ "$len" -le 8 ]; then
+        printf '%s%s' "${val:0:2}" "$(printf '%*s' $((len - 2)) '' | tr ' ' '*')"
+    else
+        printf '%s***%s' "${val:0:3}" "${val: -3}"
+    fi
+}
+
+display_config_summary() {
+    printf "  License key:       %s\n" "$(mask_value "$SCANNER_LICENSE_KEY")"
+    printf "  Connector API key: %s\n" "$(mask_value "$SCANNER_CONNECTOR_API_KEY")"
+    printf "  Registry user:     %s\n" "$(mask_value "$SCANNER_REGISTRY_USER")"
+    printf "  Registry password: %s\n" "$(mask_value "$SCANNER_REGISTRY_PASS")"
+}
+
+prompt_with_default() {
+    local label="$1" current="$2" varname="$3" is_secret="${4:-false}"
+    local masked
+    masked=$(mask_value "$current")
+    if [ "$is_secret" = true ]; then
+        _read_secret "${label} [${masked}]: " "$varname"
+    else
+        _read_input "${label} [${masked}]: " "$varname"
+    fi
+    local val
+    eval "val=\$$varname"
+    if [ -z "$val" ]; then
+        printf -v "$varname" '%s' "$current"
+    fi
+}
+
+show_changes_and_confirm() {
+    local old_license="$1" new_license="$2"
+    local old_connector="$3" new_connector="$4"
+    local old_reg_user="$5" new_reg_user="$6"
+    local old_reg_pass="$7" new_reg_pass="$8"
+    local has_changes=false
+
+    printf "\n%sProposed changes:%s\n" "${BOLD}" "${NC}"
+    if [ "$new_license" != "$old_license" ]; then
+        printf "  License key:       %s -> %s\n" "$(mask_value "$old_license")" "$(mask_value "$new_license")"
+        has_changes=true
+    fi
+    if [ "$new_connector" != "$old_connector" ]; then
+        printf "  Connector API key: %s -> %s\n" "$(mask_value "$old_connector")" "$(mask_value "$new_connector")"
+        has_changes=true
+    fi
+    if [ "$new_reg_user" != "$old_reg_user" ]; then
+        printf "  Registry user:     %s -> %s\n" "$(mask_value "$old_reg_user")" "$(mask_value "$new_reg_user")"
+        has_changes=true
+    fi
+    if [ "$new_reg_pass" != "$old_reg_pass" ]; then
+        printf "  Registry password: %s -> %s\n" "$(mask_value "$old_reg_pass")" "$(mask_value "$new_reg_pass")"
+        has_changes=true
+    fi
+
+    if [ "$has_changes" = false ]; then
+        return 1
+    fi
+
+    printf "\nApply these changes? [y/N]: "
+    local confirm=""
+    _read_input "" confirm
+    [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]
+}
+
+# --- Main Entry Point ---
+main() {
+    local command="${1:-install}"
+    shift 2>/dev/null || true
+
+    case "$command" in
+        install)
+            # Idempotency guard: detect existing installation (per D-01, D-02, D-03)
+            if [ -f "$CONFIG_FILE" ]; then
+                # shellcheck source=/dev/null
+                source "$CONFIG_FILE"
+                printf "%sDetectify Scanner is already installed.%s\n\n" "${BOLD}" "${NC}"
+                display_config_summary
+                printf "\nTo change credentials: %sdetectify-scanner reconfigure%s\n" "${BOLD}" "${NC}"
+                printf "To reinstall:          %sdetectify-scanner uninstall%s first, then install again\n" "${BOLD}" "${NC}"
+                exit 0
+            fi
+
+            printf "%sDetectify Internal Scanner Installer v%s%s\n" "${BOLD}" "${SCRIPT_VERSION}" "${NC}"
+            echo ""
+
+            # Step 1: Pre-flight checks (Phase 1)
+            preflight_checks
+            render_report || exit 1
+
+            # Step 2: Collect and validate credentials (per D-01 through D-04)
+            prompt_credentials || exit 1
+
+            # Step 3: Persist configuration (per D-13 through D-15)
+            persist_config
+
+            # Step 4: Write registry auth BEFORE k3s starts (per Research Pitfall 1)
+            write_registries_yaml
+
+            # Step 5: Install k3s (per D-05 through D-08)
+            install_k3s || exit 1
+
+            # Step 6: Deploy Helm chart via HelmChart CRD (per D-09 through D-11)
+            deploy_helm_chart || exit 1
+
+            # Step 7: Wait for all pods to be ready (per D-12)
+            wait_for_pods || exit 1
+
+            # Step 8: Verify scanner API is reachable on NodePort (per D-04)
+            verify_api_reachability || exit 1
+
+            # Make kubectl usable without sudo
+            if [ -f /etc/rancher/k3s/k3s.yaml ]; then
+                local install_user="${SUDO_USER:-}"
+                if [ -n "$install_user" ]; then
+                    local user_home user_group
+                    user_home=$(eval echo "~${install_user}")
+                    user_group=$(id -gn "$install_user")
+                    _mkdir_p "${user_home}/.kube"
+                    cp /etc/rancher/k3s/k3s.yaml "${user_home}/.kube/config"
+                    chown -R "${install_user}:${user_group}" "${user_home}/.kube"
+                    chmod 600 "${user_home}/.kube/config"
+                    if ! grep -q 'KUBECONFIG=' "${user_home}/.bashrc" 2>/dev/null; then
+                        printf '\nexport KUBECONFIG=~/.kube/config\n' >> "${user_home}/.bashrc"
+                        chown "${install_user}:${user_group}" "${user_home}/.bashrc"
+                    fi
+                fi
+            fi
+
+            # Final success message
+            echo ""
+            printf "%s%sInstallation complete!%s\n" "${GREEN}" "${BOLD}" "${NC}"
+            printf "Scanner is running. All pods are healthy in the 'scanner' namespace.\n"
+            printf "Configuration saved to %s\n" "$CONFIG_FILE"
+            local final_ip
+            final_ip=$(detect_server_ip)
+            if [ -n "$final_ip" ]; then
+                printf "\n%sScanner API: http://%s:%s%s\n" "${BOLD}" "$final_ip" "$NODEPORT" "${NC}"
+                printf "Use this URL to configure your CI/CD pipelines or to start a scan manually.\n"
+            fi
+            ;;
+        preflight)
+            # Standalone pre-flight mode (future: OPS-07)
+            preflight_checks
+            render_report || exit 1
+            ;;
+        status)
+            status_command
+            ;;
+        logs)
+            logs_command "$@"
+            ;;
+        restart)
+            restart_command "$@"
+            ;;
+        update)
+            update_command
+            ;;
+        reconfigure)
+            reconfigure_command
+            ;;
+        uninstall)
+            uninstall_command
+            ;;
+        *)
+            echo "Unknown command: $command"
+            echo "Usage: detectify-scanner [install|preflight|status|logs|restart|update|reconfigure|uninstall]"
+            exit 1
+            ;;
+    esac
+}
+
+# Wrap in main() to prevent partial-download execution (Tailscale pattern)
+if [ "${SOURCED_FOR_TESTING:-}" != "true" ]; then
+    setup_colors
+    detect_distro
+    main "$@"
+fi
