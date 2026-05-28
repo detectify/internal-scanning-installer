@@ -1,8 +1,23 @@
-# Detectify Internal Scanner — Packaged Installer
+<p align="center">
+  <img src=".github/assets/logo.png" alt="Detectify — go hack yourself." width="180" />
+</p>
 
-Single-script installer for the [Detectify Internal Scanner](https://detectify.com). Deploys and manages a fully functional scanner on a single Linux host with no Kubernetes knowledge required.
+<h1 align="center">Detectify Internal Scanner</h1>
+<p align="center">
+  <em>Packaged installer for self-hosted internal network scanning.</em>
+</p>
 
-The installer provisions a lightweight [k3s](https://k3s.io/) cluster, deploys all scanner components via Helm, and provides commands for status monitoring, log viewing, updates, credential rotation, and uninstallation.
+<p align="center">
+  <a href="https://detectify.com">detectify.com</a> ·
+  <a href="https://docs.detectify.com">Documentation</a> ·
+  <a href="https://detectify.com/support">Support</a>
+</p>
+
+---
+
+[Detectify](https://detectify.com) is the External Attack Surface Management platform powered by elite ethical hackers. The Internal Scanner extends that coverage behind your perimeter, finding vulnerabilities on hosts that aren't reachable from the public internet.
+
+This repository contains the single-script installer that deploys and manages a fully functional scanner on a single Linux host — no Kubernetes knowledge required. Under the hood it provisions a lightweight [k3s](https://k3s.io/) cluster, deploys all scanner components via Helm, and provides commands for status monitoring, log viewing, updates, credential rotation, and uninstallation.
 
 ## Requirements
 
